@@ -7,6 +7,10 @@ Usage:
   claude-cost --serve [PORT]  local web dashboard (default port 4477)
   claude-cost --install-sidecar   auto-start the web dashboard at login (macOS)
   claude-cost --since YYYY-MM-DD  manually set the date billing started
+  claude-cost --limit 50        kill switch: hard-stop Claude Code at $50/month
+  claude-cost --limit off       remove the limit
+  claude-cost --approve [N]     approve $N (default 10) extra for this month
+  claude-cost --gate            budget check for Claude Code hooks (exit 2 = block)
 
 Subscription handling: Claude Code logs don't mark individual messages as
 subscription-covered vs API-billed. Instead we read billingType from
@@ -115,6 +119,78 @@ def billed_since(state):
         save_state(state)
         return state["billed_since"]
     return None
+
+
+# ---------- budget gate (kill switch) ----------
+
+GATE_CACHE = os.path.join(STATE_DIR, "gate_cache.json")
+
+
+def _month_of(ts):
+    return ts[:7] if ts else datetime.now().strftime("%Y-%m")
+
+
+def gate_charged_this_month(since):
+    """Incrementally compute charged $ for the current month, cached across calls."""
+    try:
+        with open(GATE_CACHE) as f:
+            cache = json.load(f)
+    except Exception:
+        cache = {"files": {}}
+    files = cache.setdefault("files", {})
+    for path in iter_jsonl():
+        ent = files.setdefault(path, {"offset": 0, "months": {}})
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        if size < ent["offset"]:
+            ent["offset"], ent["months"] = 0, {}
+        if size == ent["offset"]:
+            continue
+        with open(path, errors="ignore") as f:
+            f.seek(ent["offset"])
+            chunk = f.read()
+            ent["offset"] = f.tell()
+        for line in chunk.split("\n"):
+            rec = parse_record(line)
+            if not rec:
+                continue
+            if since and rec["timestamp"] >= since:
+                m = _month_of(rec["timestamp"])
+                ent["months"][m] = ent["months"].get(m, 0.0) + cost_for_usage(rec["model"], rec["usage"])
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = GATE_CACHE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cache, f)
+    os.replace(tmp, GATE_CACHE)
+    month = datetime.now().strftime("%Y-%m")
+    return sum(ent["months"].get(month, 0.0) for ent in files.values())
+
+
+def run_gate(state):
+    """Exit 0 if within budget, exit 2 (blocking) if the limit is hit."""
+    limit = state.get("limit")
+    if not limit:
+        sys.exit(0)
+    since = billed_since(state)
+    if not since:
+        sys.exit(0)  # on subscription — nothing is charged
+    spent = gate_charged_this_month(since)
+    month = datetime.now().strftime("%Y-%m")
+    headroom = (state.get("headroom") or {}).get(month, 0.0)
+    effective = limit + headroom
+    if spent >= effective:
+        sys.stderr.write(
+            f"BUDGET KILL SWITCH: ${spent:,.2f} of ${effective:,.2f} spent this month "
+            f"(limit ${limit:,.2f}" + (f" + ${headroom:,.2f} approved" if headroom else "") + "). "
+            "Claude Code is paused until the user approves more spend.\n"
+            "To continue, the user must run in a separate terminal:\n"
+            f"  claude-cost --approve 10     # approve $10 more this month\n"
+            f"  claude-cost --limit {int(limit) * 2}      # or raise the monthly cap\n"
+        )
+        sys.exit(2)
+    sys.exit(0)
 
 
 # ---------- log scanning ----------
@@ -323,6 +399,34 @@ def install_sidecar(port):
 def main():
     args = sys.argv[1:]
     state = load_state()
+
+    if "--gate" in args:
+        run_gate(state)  # exits
+
+    if "--limit" in args:
+        i = args.index("--limit")
+        val = args[i + 1] if len(args) > i + 1 else "off"
+        if val == "off":
+            state.pop("limit", None)
+            print("Monthly spend limit removed.")
+        else:
+            state["limit"] = float(val)
+            print(f"Monthly spend limit set to ${float(val):,.2f}. "
+                  "Claude Code will hard-stop at the limit (via the budget-gate hook).")
+        save_state(state)
+        return
+
+    if "--approve" in args:
+        i = args.index("--approve")
+        amt = float(args[i + 1]) if len(args) > i + 1 and args[i + 1].replace(".", "").isdigit() else 10.0
+        month = datetime.now().strftime("%Y-%m")
+        hr = state.setdefault("headroom", {})
+        hr[month] = hr.get(month, 0.0) + amt
+        save_state(state)
+        limit = state.get("limit", 0)
+        print(f"Approved ${amt:,.2f} extra for {month}. "
+              f"Effective cap this month: ${limit + hr[month]:,.2f}.")
+        return
 
     if "--since" in args:
         i = args.index("--since")

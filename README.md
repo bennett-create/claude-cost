@@ -45,6 +45,31 @@ and applies published per-model pricing, including cache economics: cache reads 
 0.1× input price, 5-minute cache writes at 1.25×, 1-hour cache writes at 2×.
 Sonnet 5's introductory pricing is applied automatically through 2026-08-31.
 
+## Kill switch (spend limit)
+
+Hard-stop Claude Code when monthly charged spend hits a cap — it can't make
+another API call until you approve more:
+
+```sh
+claude-cost --limit 50      # stop everything at $50/month
+claude-cost --approve 10    # you decide to continue: +$10 this month
+claude-cost --limit off     # disarm
+```
+
+Enforcement is a Claude Code hook: add this to `~/.claude/settings.json`
+(claude-cost's `--gate` exits 2 when over budget, which blocks the action):
+
+```json
+"hooks": {
+  "PreToolUse":       [{ "hooks": [{ "type": "command", "command": "claude-cost --gate", "timeout": 15 }] }],
+  "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "claude-cost --gate", "timeout": 15 }] }]
+}
+```
+
+Use the full path to claude-cost in the command. Over budget, every tool call
+and new prompt is blocked with a message telling you how to approve more.
+Warm-cache gate checks take ~40ms. Approvals reset each calendar month.
+
 ## Caveats
 
 - This reads local logs, not Anthropic's billing system. It should match your bill,
