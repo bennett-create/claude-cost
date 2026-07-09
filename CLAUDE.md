@@ -19,6 +19,8 @@ curl -fsSL https://raw.githubusercontent.com/bennett-create/claude-cost/main/cla
 # 2. Optional: spend cap / kill switch
 claude-cost --install-gate    # wires PreToolUse + UserPromptSubmit hooks into ~/.claude/settings.json
 claude-cost --limit 50        # hard-stop Claude Code at $50 charged this month
+claude-cost --limit-hour 5    # optional: max $5 charged in any rolling 60 min
+claude-cost --limit-prompt 2  # optional: max $2 per single prompt/turn
 
 # 3. Optional: always-on web dashboard at http://localhost:4477
 claude-cost --install-sidecar
@@ -33,9 +35,16 @@ of launchd.
 - **The kill switch governs YOU.** If the user has the gate installed and armed,
   every one of your tool calls runs `claude-cost --gate` first. If the budget is
   exhausted, your tool calls will be blocked with a "BUDGET KILL SWITCH" message.
-  Do not try to work around it — tell the user to run `claude-cost --approve <N>`
-  or `claude-cost --limit <higher|off>` in a terminal. That approval flow is the
-  entire point of the tool.
+  Do not try to work around it — tell the user how to continue and stop. Monthly
+  limit: `claude-cost --approve <N>`. Hourly limit: wait for the rolling window,
+  or `claude-cost --snooze <min>`. Per-prompt limit: the user just sends a new
+  message (that IS the approval; it resets the per-prompt budget). That approval
+  flow is the entire point of the tool.
+- **Per-prompt tracking** works by resetting a per-file `prompt_spend` counter
+  whenever a real user prompt appears in the session log (`_is_user_prompt` —
+  string content or text blocks; tool_result turns and sidechains don't count).
+  The hourly limit sums a rolling `recent` event list in the gate cache. Snooze
+  (`snooze_until` in state.json) waives hourly+prompt checks but never monthly.
 - **Keep it a single stdlib-only file.** No pip dependencies, no splitting into
   modules. Friends install it with one curl; that property is load-bearing.
 - **Gate performance is a hard constraint.** `--gate` runs before every tool call.

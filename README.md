@@ -41,8 +41,11 @@ then run `python claude-cost` from a terminal. WSL works Linux-style with no ext
 | `claude-cost --serve [PORT]` | Web dashboard at `http://localhost:4477` (JSON at `/json`) |
 | `claude-cost --install-sidecar` | Auto-start the web dashboard at login (macOS launchd / Windows Startup folder) |
 | `claude-cost --limit 50` | **Kill switch**: hard-stop Claude Code at $50 charged this month |
+| `claude-cost --limit-hour 5` | Hard-stop at $5 charged in any rolling 60 minutes |
+| `claude-cost --limit-prompt 2` | Hard-stop a single prompt/turn that exceeds $2 (runaway-loop guard) |
+| `claude-cost --limit[-hour\|-prompt] off` | Disarm that limit |
 | `claude-cost --approve 10` | Approve $10 extra headroom for the current month |
-| `claude-cost --limit off` | Disarm the kill switch |
+| `claude-cost --snooze 15` | Waive hourly + per-prompt limits for 15 minutes (monthly still applies) |
 | `claude-cost --install-gate` | Wire kill-switch enforcement into Claude Code (one time) |
 | `claude-cost --since 2026-07-15` | Manually set the date per-token billing started |
 | `claude-cost --gate` | The budget check itself (used by the hooks; exit 2 = block) |
@@ -53,9 +56,13 @@ For anyone moving from a Claude subscription to per-token API billing and worrie
 about runaway spend on commercial work:
 
 ```sh
-claude-cost --install-gate   # once
-claude-cost --limit 50       # cap: $50/month
+claude-cost --install-gate     # once
+claude-cost --limit 50         # cap: $50/month
+claude-cost --limit-hour 5     # optional: max $5 in any rolling hour
+claude-cost --limit-prompt 2   # optional: no single prompt may burn more than $2
 ```
+
+The three limits are independent — set any combination.
 
 `--install-gate` adds two hooks to `~/.claude/settings.json`: a `PreToolUse` hook
 (runs before **every tool call** Claude makes) and a `UserPromptSubmit` hook (runs
@@ -78,6 +85,18 @@ Approvals reset each calendar month, so a one-off "fine, $20 more in July"
 doesn't silently loosen August. Existing hooks in settings.json are preserved
 (the installer merges, and won't add duplicates). Review or disable anytime via
 `/hooks` inside Claude Code.
+
+**How each limit recovers:**
+
+| Limit | Trips when | Unblocks when |
+|---|---|---|
+| `--limit` (monthly) | Month's charged spend ≥ cap | You run `--approve N` or raise/remove the cap. Snooze does **not** bypass it. |
+| `--limit-hour` | Last 60 min of spend ≥ cap | Automatically as spend rolls out of the window, or `--snooze` |
+| `--limit-prompt` | One prompt's turn costs ≥ cap | You send Claude a new message (that's the approval), or `--snooze` |
+
+The per-prompt limit is the runaway-agentic-loop guard: it stops Claude
+mid-task if a single turn spirals, and simply replying continues the work with
+a fresh per-prompt budget.
 
 **Overshoot bound:** the gate counts completed API responses, so the response
 that crosses the line finishes before the block lands — overshoot is one

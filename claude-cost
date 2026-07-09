@@ -8,8 +8,11 @@ Usage:
   claude-cost --install-sidecar   auto-start the web dashboard at login (macOS)
   claude-cost --since YYYY-MM-DD  manually set the date billing started
   claude-cost --limit 50        kill switch: hard-stop Claude Code at $50/month
-  claude-cost --limit off       remove the limit
+  claude-cost --limit-hour 5    hard-stop at $5 charged in any rolling 60 minutes
+  claude-cost --limit-prompt 2  hard-stop a single prompt/turn that exceeds $2
+  claude-cost --limit[-hour|-prompt] off   remove that limit
   claude-cost --approve [N]     approve $N (default 10) extra for this month
+  claude-cost --snooze [MIN]    waive hourly+per-prompt limits for MIN (default 15) minutes
   claude-cost --gate            budget check for Claude Code hooks (exit 2 = block)
   claude-cost --install-gate    wire the kill-switch hooks into ~/.claude/settings.json
 
@@ -26,7 +29,7 @@ import re
 import sys
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 CLAUDE_JSON = os.path.expanduser("~/.claude.json")
@@ -131,22 +134,36 @@ def _month_of(ts):
     return ts[:7] if ts else datetime.now().strftime("%Y-%m")
 
 
-def gate_charged_this_month(since):
-    """Incrementally compute charged $ for the current month, cached across calls."""
+def _is_user_prompt(d):
+    """True if a raw log record is a real user prompt (not a tool_result turn)."""
+    if d.get("type") != "user" or d.get("isSidechain"):
+        return False
+    content = (d.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return True
+    if isinstance(content, list):
+        return any(isinstance(b, dict) and b.get("type") == "text" for b in content)
+    return False
+
+
+def gate_scan(since):
+    """Incremental scan. Returns (month_total, hour_total, files) — also tracks
+    per-file spend since the last user prompt and a rolling last-hour event list."""
     try:
         with open(GATE_CACHE) as f:
             cache = json.load(f)
     except Exception:
         cache = {"files": {}}
     files = cache.setdefault("files", {})
+    recent = cache.setdefault("recent", [])  # [iso_ts, cost] pairs, pruned to 1h
     for path in iter_jsonl():
-        ent = files.setdefault(path, {"offset": 0, "months": {}})
+        ent = files.setdefault(path, {"offset": 0, "months": {}, "prompt_spend": 0.0})
         try:
             size = os.path.getsize(path)
         except OSError:
             continue
         if size < ent["offset"]:
-            ent["offset"], ent["months"] = 0, {}
+            ent.update(offset=0, months={}, prompt_spend=0.0)
         if size == ent["offset"]:
             continue
         with open(path, errors="ignore") as f:
@@ -154,43 +171,121 @@ def gate_charged_this_month(since):
             chunk = f.read()
             ent["offset"] = f.tell()
         for line in chunk.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if _is_user_prompt(d):
+                ent["prompt_spend"] = 0.0  # new prompt starts a fresh per-prompt budget
+                continue
             rec = parse_record(line)
             if not rec:
                 continue
             if since and rec["timestamp"] >= since:
+                c = cost_for_usage(rec["model"], rec["usage"])
                 m = _month_of(rec["timestamp"])
-                ent["months"][m] = ent["months"].get(m, 0.0) + cost_for_usage(rec["model"], rec["usage"])
+                ent["months"][m] = ent["months"].get(m, 0.0) + c
+                ent["prompt_spend"] = ent.get("prompt_spend", 0.0) + c
+                recent.append([rec["timestamp"], c])
+    hour_ago = datetime.now(timezone.utc).timestamp() - 3600
+    kept = []
+    hour_total = 0.0
+    for ts, c in recent:
+        try:
+            t = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+        if t >= hour_ago:
+            kept.append([ts, c])
+            hour_total += c
+    cache["recent"] = kept
     os.makedirs(STATE_DIR, exist_ok=True)
     tmp = GATE_CACHE + ".tmp"
     with open(tmp, "w") as f:
         json.dump(cache, f)
     os.replace(tmp, GATE_CACHE)
     month = datetime.now().strftime("%Y-%m")
-    return sum(ent["months"].get(month, 0.0) for ent in files.values())
+    month_total = sum(ent["months"].get(month, 0.0) for ent in files.values())
+    return month_total, hour_total, files
+
+
+def _read_hook_input():
+    if sys.stdin.isatty():
+        return {}
+    try:
+        return json.loads(sys.stdin.read() or "{}")
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _block(msg):
+    sys.stderr.write(msg)
+    sys.exit(2)
 
 
 def run_gate(state):
-    """Exit 0 if within budget, exit 2 (blocking) if the limit is hit."""
-    limit = state.get("limit")
-    if not limit:
+    """Exit 0 if within budget, exit 2 (blocking) if any limit is hit."""
+    limit_month = state.get("limit")
+    limit_hour = state.get("limit_hour")
+    limit_prompt = state.get("limit_prompt")
+    if not (limit_month or limit_hour or limit_prompt):
         sys.exit(0)
     since = billed_since(state)
     if not since:
         sys.exit(0)  # on subscription — nothing is charged
-    spent = gate_charged_this_month(since)
-    month = datetime.now().strftime("%Y-%m")
-    headroom = (state.get("headroom") or {}).get(month, 0.0)
-    effective = limit + headroom
-    if spent >= effective:
-        sys.stderr.write(
-            f"BUDGET KILL SWITCH: ${spent:,.2f} of ${effective:,.2f} spent this month "
-            f"(limit ${limit:,.2f}" + (f" + ${headroom:,.2f} approved" if headroom else "") + "). "
-            "Claude Code is paused until the user approves more spend.\n"
-            "To continue, the user must run in a separate terminal:\n"
-            f"  claude-cost --approve 10     # approve $10 more this month\n"
-            f"  claude-cost --limit {int(limit) * 2}      # or raise the monthly cap\n"
+    info = _read_hook_input()
+    month_total, hour_total, files = gate_scan(since)
+
+    # Monthly cap — the hard one; snooze does NOT bypass it.
+    if limit_month:
+        month = datetime.now().strftime("%Y-%m")
+        headroom = (state.get("headroom") or {}).get(month, 0.0)
+        effective = limit_month + headroom
+        if month_total >= effective:
+            _block(
+                f"BUDGET KILL SWITCH: ${month_total:,.2f} of ${effective:,.2f} spent this month "
+                f"(limit ${limit_month:,.2f}" + (f" + ${headroom:,.2f} approved" if headroom else "") + "). "
+                "Claude Code is paused until the user approves more spend.\n"
+                "To continue, the user must run in a separate terminal:\n"
+                f"  claude-cost --approve 10     # approve $10 more this month\n"
+                f"  claude-cost --limit {int(limit_month) * 2}      # or raise the monthly cap\n"
+            )
+
+    snoozed = False
+    snooze_until = state.get("snooze_until")
+    if snooze_until:
+        snoozed = datetime.now(timezone.utc) < datetime.fromisoformat(snooze_until)
+
+    # Rolling last-60-minutes cap.
+    if limit_hour and not snoozed and hour_total >= limit_hour:
+        _block(
+            f"HOURLY BUDGET: ${hour_total:,.2f} charged in the last 60 minutes "
+            f"(limit ${limit_hour:,.2f}/h). Claude Code is paused.\n"
+            "It unblocks by itself as spend rolls out of the window, or the user can run:\n"
+            "  claude-cost --snooze 15        # waive hourly/per-prompt limits for 15 min\n"
+            f"  claude-cost --limit-hour {int(limit_hour) * 2}     # or raise the hourly cap\n"
         )
-        sys.exit(2)
+
+    # Per-prompt cap — only mid-turn (PreToolUse); a fresh user prompt resets it.
+    session_id = info.get("session_id")
+    is_pretooluse = info.get("hook_event_name") == "PreToolUse" or "tool_name" in info
+    if limit_prompt and not snoozed and is_pretooluse and session_id:
+        for path, ent in files.items():
+            if os.path.basename(path).startswith(session_id):
+                spend = ent.get("prompt_spend", 0.0)
+                if spend >= limit_prompt:
+                    _block(
+                        f"PER-PROMPT BUDGET: this prompt has cost ${spend:,.2f} "
+                        f"(limit ${limit_prompt:,.2f}). Claude is stopped mid-task.\n"
+                        "Sending Claude a new message resets the per-prompt budget and continues.\n"
+                        "Or the user can run:\n"
+                        "  claude-cost --snooze 15          # waive hourly/per-prompt limits for 15 min\n"
+                        f"  claude-cost --limit-prompt {limit_prompt * 2:g}    # or raise the cap\n"
+                    )
+                break
     sys.exit(0)
 
 
@@ -443,17 +538,32 @@ def main():
         install_gate()
         return
 
-    if "--limit" in args:
-        i = args.index("--limit")
-        val = args[i + 1] if len(args) > i + 1 else "off"
-        if val == "off":
-            state.pop("limit", None)
-            print("Monthly spend limit removed.")
-        else:
-            state["limit"] = float(val)
-            print(f"Monthly spend limit set to ${float(val):,.2f}. "
-                  "Claude Code will hard-stop at the limit (via the budget-gate hook).")
+    for flag, key, label in (
+        ("--limit", "limit", "Monthly spend limit"),
+        ("--limit-hour", "limit_hour", "Hourly (rolling 60 min) spend limit"),
+        ("--limit-prompt", "limit_prompt", "Per-prompt spend limit"),
+    ):
+        if flag in args:
+            i = args.index(flag)
+            val = args[i + 1] if len(args) > i + 1 else "off"
+            if val == "off":
+                state.pop(key, None)
+                print(f"{label} removed.")
+            else:
+                state[key] = float(val)
+                print(f"{label} set to ${float(val):,.2f}. "
+                      "Claude Code will hard-stop at the limit (via the budget-gate hook).")
+            save_state(state)
+            return
+
+    if "--snooze" in args:
+        i = args.index("--snooze")
+        mins = float(args[i + 1]) if len(args) > i + 1 and args[i + 1].replace(".", "").isdigit() else 15.0
+        until = datetime.now(timezone.utc) + timedelta(minutes=mins)
+        state["snooze_until"] = until.isoformat()
         save_state(state)
+        print(f"Hourly and per-prompt limits waived for {mins:g} minutes "
+              f"(until {until.strftime('%H:%M:%S')} UTC). Monthly limit still applies.")
         return
 
     if "--approve" in args:
