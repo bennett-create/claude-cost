@@ -11,6 +11,12 @@ curl -fsSL https://raw.githubusercontent.com/bennett-create/claude-cost/main/cla
 
 (Or drop it anywhere on your PATH — it's a single file.)
 
+**Windows** (needs [Python 3](https://python.org)): download
+[`claude-cost`](https://raw.githubusercontent.com/bennett-create/claude-cost/main/claude-cost),
+then run `python claude-cost` from a terminal. `--install-sidecar` works too —
+it adds a Startup-folder entry that launches the web dashboard at login.
+Works in WSL as well (Linux-style, no extra steps).
+
 ## Use
 
 ```sh

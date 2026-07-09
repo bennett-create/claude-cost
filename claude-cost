@@ -252,7 +252,7 @@ def run_tui(tracker, once=False):
         if once:
             print(out)
             return
-        os.system("clear")
+        os.system("cls" if os.name == "nt" else "clear")
         print(out + "\n\n(Ctrl-C to stop)")
         time.sleep(2)
 
@@ -282,6 +282,24 @@ def run_serve(tracker, port):
 
 
 def install_sidecar(port):
+    if sys.platform == "win32":
+        # Windows: register a Startup shortcut via a .bat file.
+        startup = os.path.join(
+            os.environ.get("APPDATA", os.path.expanduser("~")),
+            "Microsoft", "Windows", "Start Menu", "Programs", "Startup",
+        )
+        os.makedirs(startup, exist_ok=True)
+        bat = os.path.join(startup, "claude-cost.bat")
+        script = os.path.realpath(__file__)
+        with open(bat, "w") as f:
+            f.write(f'@echo off\nstart "" /min pythonw "{script}" --serve {port}\n')
+        os.system(f'start "" /min pythonw "{script}" --serve {port}')
+        print(f"Sidecar installed (Startup folder) and started -> http://localhost:{port}")
+        print(f"To remove: delete {bat}")
+        return
+    if sys.platform != "darwin":
+        sys.exit("--install-sidecar supports macOS and Windows; on Linux run "
+                 f"'claude-cost --serve {port}' under systemd/tmux instead.")
     plist_path = os.path.expanduser("~/Library/LaunchAgents/local.claude-cost.plist")
     script = os.path.realpath(__file__)
     plist = f"""<?xml version="1.0" encoding="UTF-8"?>
