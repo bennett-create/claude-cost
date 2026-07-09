@@ -11,6 +11,7 @@ Usage:
   claude-cost --limit off       remove the limit
   claude-cost --approve [N]     approve $N (default 10) extra for this month
   claude-cost --gate            budget check for Claude Code hooks (exit 2 = block)
+  claude-cost --install-gate    wire the kill-switch hooks into ~/.claude/settings.json
 
 Subscription handling: Claude Code logs don't mark individual messages as
 subscription-covered vs API-billed. Instead we read billingType from
@@ -191,6 +192,39 @@ def run_gate(state):
         )
         sys.exit(2)
     sys.exit(0)
+
+
+def install_gate():
+    """Merge the budget-gate hooks into ~/.claude/settings.json."""
+    settings_path = os.path.expanduser("~/.claude/settings.json")
+    try:
+        with open(settings_path) as f:
+            settings = json.load(f)
+    except FileNotFoundError:
+        settings = {}
+    except json.JSONDecodeError:
+        sys.exit(f"{settings_path} is not valid JSON — fix it first, then re-run.")
+    script = os.path.realpath(__file__)
+    gate_cmd = f"{script} --gate"
+    hook = {"type": "command", "command": gate_cmd, "timeout": 15}
+    hooks = settings.setdefault("hooks", {})
+    changed = False
+    for event in ("PreToolUse", "UserPromptSubmit"):
+        entries = hooks.setdefault(event, [])
+        existing = [h for e in entries for h in e.get("hooks", [])
+                    if "claude-cost" in h.get("command", "") and "--gate" in h.get("command", "")]
+        if existing:
+            print(f"{event}: gate hook already present, leaving as-is.")
+            continue
+        entries.append({"hooks": [hook]})
+        changed = True
+        print(f"{event}: gate hook added.")
+    if changed:
+        with open(settings_path, "w") as f:
+            json.dump(settings, f, indent=2)
+    print(f"\nKill switch enforcement installed in {settings_path}.")
+    print("Set a cap with: claude-cost --limit 50")
+    print("If a running Claude Code session doesn't pick it up, open /hooks once or restart it.")
 
 
 # ---------- log scanning ----------
@@ -402,6 +436,10 @@ def main():
 
     if "--gate" in args:
         run_gate(state)  # exits
+
+    if "--install-gate" in args:
+        install_gate()
+        return
 
     if "--limit" in args:
         i = args.index("--limit")
